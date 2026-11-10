@@ -4,7 +4,7 @@ A guide for using the `lazy_zip` package inside your own application: installing
 call costs, recipes for common jobs, and what you can rely on. For the reference tables, see the
 [README](../README.md).
 
-`lazy_zip` is pre-1.0, so the API may change between versions. Pin a commit and read the changes
+`lazy_zip` is pre-1.0, so the API may change between versions. Pin a release tag and read the changes
 before upgrading.
 
 <!-- The Python examples run in tests/test_docs.py against a local server that stands in for
@@ -39,7 +39,7 @@ OpenSSL dependency.
 commit so builds are repeatable:
 
 ```bash
-pip install "lazy-zip @ git+https://github.com/alenpaulvarghese/lazy-zip@<commit>#subdirectory=python"
+pip install "lazy-zip @ git+https://github.com/alenpaulvarghese/lazy-zip@v0.3.0#subdirectory=python"
 ```
 
 In `requirements.txt`, use the same `lazy-zip @ git+...` line. In `pyproject.toml`:
@@ -47,7 +47,7 @@ In `requirements.txt`, use the same `lazy-zip @ git+...` line. In `pyproject.tom
 ```toml
 [project]
 dependencies = [
-    "lazy-zip @ git+https://github.com/alenpaulvarghese/lazy-zip@<commit>#subdirectory=python",
+    "lazy-zip @ git+https://github.com/alenpaulvarghese/lazy-zip@v0.3.0#subdirectory=python",
 ]
 ```
 

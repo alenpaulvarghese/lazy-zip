@@ -5,7 +5,7 @@ reads the archive's table of contents with HTTP Range requests, then fetches onl
 ask for. The API follows `zipfile.ZipFile`, like the [`remotezip`](https://pypi.org/project/remotezip/)
 package, and the work happens in Rust, outside the GIL.
 
-**Pre-1.0 and not on PyPI yet.** The API may change between versions, so pin a commit.
+**Pre-1.0 and not on PyPI yet.** The API may change between versions, so pin a release tag.
 
 - [Install](#install)
 - [Quick start](#quick-start)
@@ -27,7 +27,7 @@ Linux. Wheels are specific to a Python version and platform.
 Straight from GitHub, in one step (pip builds it with maturin):
 
 ```bash
-pip install "lazy-zip @ git+https://github.com/alenpaulvarghese/lazy-zip@<commit>#subdirectory=python"
+pip install "lazy-zip @ git+https://github.com/alenpaulvarghese/lazy-zip@v0.3.0#subdirectory=python"
 ```
 
 The same line works in `requirements.txt`, or as a dependency in `pyproject.toml`. To build a

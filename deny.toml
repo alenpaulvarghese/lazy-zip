@@ -4,11 +4,6 @@
 # vulnerability. Remove each one once Tauri moves off it.
 ignore = [
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: a build-time macro in Tauri's Linux GTK bindings" },
-    { id = "RUSTSEC-2025-0075", reason = "unic-char-range: used by urlpattern in tauri-utils" },
-    { id = "RUSTSEC-2025-0080", reason = "unic-common: used by urlpattern in tauri-utils" },
-    { id = "RUSTSEC-2025-0081", reason = "unic-char-property: used by urlpattern in tauri-utils" },
-    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: used by urlpattern in tauri-utils" },
-    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: used by urlpattern in tauri-utils" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant: used by zbus in Tauri's opener plugin on Linux" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names: used by zbus in Tauri's opener plugin on Linux" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: used by zbus in Tauri's opener plugin on Linux" },

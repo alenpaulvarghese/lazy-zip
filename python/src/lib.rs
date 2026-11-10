@@ -229,7 +229,7 @@ where
 /// Folders are listed whether or not the archive has an entry for them, and entries whose names
 /// can't be written safely (or aren't valid UTF-8) are left out. Siblings are sorted by name.
 /// Read-only.
-#[pyclass(frozen, skip_from_py_object, module = "lazy_zip")]
+#[pyclass(frozen, module = "lazy_zip")]
 #[derive(Clone)]
 pub struct FileEntry {
     /// The last part of the path, such as `readme.txt`.

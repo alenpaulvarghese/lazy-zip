@@ -13,12 +13,12 @@
 //!
 //! # Adding the dependency
 //!
-//! The crate isn't on crates.io. Depend on it from Git, pinned to a commit, since the API may
+//! The crate isn't on crates.io. Depend on it from Git, pinned to a release tag, since the API may
 //! change in any release before 1.0:
 //!
 //! ```toml
 //! [dependencies]
-//! lazy-zip-core = { git = "https://github.com/alenpaulvarghese/lazy-zip", rev = "<commit>" }
+//! lazy-zip-core = { git = "https://github.com/alenpaulvarghese/lazy-zip", tag = "v0.3.0" }
 //! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!

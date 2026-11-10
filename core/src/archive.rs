@@ -19,6 +19,9 @@ use crate::http_reader::{ReaderConfig, RemoteFile, RemoteHttpReader};
 use async_compression::tokio::bufread::{
     BzDecoder, Deflate64Decoder, DeflateDecoder, XzDecoder, ZstdDecoder,
 };
+// Deprecated in favour of the new `read1` module, which is a different API. Moving to it means
+// re-checking every limit and test that depends on how the directory is parsed.
+#[allow(deprecated)]
 use async_zip::base::read::seek::ZipFileReader;
 use async_zip::{Compression, StoredZipEntry, ZipString};
 use std::cmp::min;
@@ -268,6 +271,7 @@ impl RemoteArchive {
     }
 
     /// Reads the directory through `reader`, which must not have been read from yet.
+    #[allow(deprecated)]
     pub async fn from_reader(mut reader: RemoteHttpReader) -> Result<Self> {
         let fetch_limit = reader.fetch_limit();
         let zip = ZipFileReader::new(BufReader::new(&mut reader).compat()).await?;
