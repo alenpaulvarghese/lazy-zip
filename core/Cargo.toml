@@ -9,7 +9,7 @@ repository = "https://github.com/alenpaulvarghese/lazy-zip"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false }
-async_zip = { version = "0.0.18", features = ["tokio", "deflate", "deflate64", "bzip2", "zstd", "lzma", "xz"] }
+async_zip = { version = "0.0.19", features = ["tokio", "deflate", "deflate64", "bzip2", "zstd", "lzma", "xz"] }
 # The decoders async_zip uses, driven directly so each entry is read with only its own bytes.
 async-compression = { version = "0.4", features = ["tokio", "deflate", "deflate64", "bzip2", "zstd", "xz"] }
 crc32fast = "1"
