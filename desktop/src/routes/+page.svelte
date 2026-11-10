@@ -1,7 +1,9 @@
 <script lang="ts">
   import { ask, open, save } from "@tauri-apps/plugin-dialog";
+  import { tick } from "svelte";
   import { findExistingFiles, scanZip } from "$lib/api";
   import DownloadsPanel from "$lib/components/DownloadsPanel.svelte";
+  import HeadersPanel, { type HeaderRow } from "$lib/components/HeadersPanel.svelte";
   import HelpBar from "$lib/components/HelpBar.svelte";
   import Spinner from "$lib/components/Spinner.svelte";
   import TreeView from "$lib/components/TreeView.svelte";
@@ -25,6 +27,7 @@
     type SortKey,
     type TreeIndex,
   } from "$lib/tree";
+  import { headersToSend, sameHeaders, withLoginHint, type Header } from "$lib/headers";
   import type { ShortcutContext } from "$lib/shortcuts";
   import type { ScanResult } from "$lib/types";
 
@@ -36,6 +39,17 @@
   let index = $state.raw<TreeIndex | null>(null);
   let isLoading = $state(false);
   let errorMsg = $state("");
+
+  // Headers can hold passwords and tokens, so they're only ever kept in memory.
+  let headerRows = $state<HeaderRow[]>([]);
+  let scannedHeaders = $state.raw<Header[]>([]);
+  let showHeaders = $state(false);
+  let headersPanel = $state<ReturnType<typeof HeadersPanel>>();
+  let pendingHeaders = $derived(headersToSend(headerRows));
+  let headerCount = $derived(headerRows.filter((row) => row.name.trim() || row.value.trim()).length);
+  let headersStale = $derived(
+    scanResult !== null && !("headers" in pendingHeaders && sameHeaders(pendingHeaders.headers, scannedHeaders)),
+  );
 
   // Tree state
   let expanded = $state.raw<ReadonlySet<number>>(new Set());
@@ -88,6 +102,12 @@
   async function scan(event: Event) {
     event.preventDefault();
     if (!url) return;
+    if ("error" in pendingHeaders) {
+      errorMsg = pendingHeaders.error;
+      showHeaders = true;
+      return;
+    }
+    const scanningHeaders = pendingHeaders.headers;
 
     isLoading = true;
     errorMsg = "";
@@ -101,9 +121,10 @@
 
     const scanningUrl = url;
     try {
-      const result = await scanZip(scanningUrl);
+      const result = await scanZip(scanningUrl, scanningHeaders);
       const newIndex = buildIndex(result.nodes);
       scannedUrl = scanningUrl;
+      scannedHeaders = scanningHeaders;
       index = newIndex;
       scanResult = result;
       // A single top-level folder would otherwise be one lonely row.
@@ -111,9 +132,17 @@
         expanded = new Set(newIndex.roots);
       }
     } catch (err: unknown) {
-      errorMsg = String(err);
+      errorMsg = withLoginHint(String(err), scanningHeaders.length > 0);
     } finally {
       isLoading = false;
+    }
+  }
+
+  async function toggleHeaders() {
+    showHeaders = !showHeaders;
+    if (showHeaders && headerRows.length === 0) {
+      await tick();
+      await headersPanel?.addRow();
     }
   }
 
@@ -182,6 +211,7 @@
     await downloads.start({
       label: node.name,
       url: scannedUrl,
+      headers: scannedHeaders,
       target: { kind: "file", zipPath: node.path, dest },
       sizes: new Map([[node.path, node.size]]),
       workers: normalizeWorkers(downloadWorkers),
@@ -224,6 +254,7 @@
     await downloads.start({
       label,
       url: scannedUrl,
+      headers: scannedHeaders,
       target: { kind: "selection", destDir, base, files: filesToDownload },
       sizes,
       workers: normalizeWorkers(downloadWorkers),
@@ -258,7 +289,7 @@
   function handleFocusIn(event: FocusEvent) {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
-    if (target.matches('input[type="url"]')) shortcutContext = "url";
+    if (target.matches('input[type="url"], input[data-header-field]')) shortcutContext = "url";
     else if (target.matches('input[type="search"]')) shortcutContext = "search";
     else if (target.matches('[role="tree"]')) shortcutContext = "tree";
   }
@@ -314,28 +345,51 @@
   <main class="flex-1 flex flex-col overflow-hidden">
     <!-- URL input area -->
     <div class="px-4 py-3 bg-bg-surface border-b border-border-default shrink-0">
-      <form class="flex gap-2 items-center" onsubmit={scan}>
-        <div class="flex-1 relative">
-          <input
-            type="url"
-            bind:value={url}
-            placeholder="Paste a remote .zip URL..."
-            class="w-full bg-bg-input text-text-primary text-sm px-3 py-2 rounded-lg border border-border-default focus:border-accent focus:ring-1 focus:ring-accent/30 outline-none transition-all placeholder:text-text-tertiary"
-            required
-          />
+      <form onsubmit={scan}>
+        <div class="flex gap-2 items-center">
+          <div class="flex-1 relative">
+            <input
+              type="url"
+              bind:value={url}
+              placeholder="Paste a remote .zip URL..."
+              class="w-full bg-bg-input text-text-primary text-sm px-3 py-2 rounded-lg border border-border-default focus:border-accent focus:ring-1 focus:ring-accent/30 outline-none transition-all placeholder:text-text-tertiary"
+              required
+            />
+          </div>
+          <button
+            type="button"
+            class="text-sm px-3 py-2 rounded-lg border transition-colors flex items-center gap-1.5 shrink-0 {showHeaders || headerCount > 0
+              ? 'border-accent/40 text-text-primary bg-accent-subtle'
+              : 'border-border-default text-text-secondary hover:text-text-primary hover:bg-bg-hover/60'}"
+            aria-expanded={showHeaders}
+            aria-controls="request-headers"
+            title="Add headers for archives that need a login or a token"
+            onclick={toggleHeaders}
+          >
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.78 7.78 5.5 5.5 0 017.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+            </svg>
+            Headers
+            {#if headerCount > 0}
+              <span class="min-w-[18px] h-[18px] px-1 rounded-full bg-accent text-bg-base text-[10px] font-semibold leading-[18px] text-center">{headerCount}</span>
+            {/if}
+          </button>
+          <button
+            type="submit"
+            disabled={isLoading}
+            class="bg-accent hover:bg-accent-hover text-bg-base text-sm font-semibold px-5 py-2 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 shrink-0"
+          >
+            {#if isLoading}
+              <Spinner />
+              Scanning…
+            {:else}
+              Scan
+            {/if}
+          </button>
         </div>
-        <button
-          type="submit"
-          disabled={isLoading}
-          class="bg-accent hover:bg-accent-hover text-bg-base text-sm font-semibold px-5 py-2 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 shrink-0"
-        >
-          {#if isLoading}
-            <Spinner />
-            Scanning…
-          {:else}
-            Scan
-          {/if}
-        </button>
+        {#if showHeaders}
+          <HeadersPanel bind:this={headersPanel} bind:rows={headerRows} stale={headersStale} />
+        {/if}
       </form>
 
       {#if errorMsg}

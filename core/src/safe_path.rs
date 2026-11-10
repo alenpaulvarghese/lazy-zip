@@ -1,9 +1,17 @@
 //! Validation of ZIP entry names, which come from an untrusted archive.
+//!
+//! The same rules apply on every OS, so an archive behaves the same everywhere. A name is refused
+//! if it's absolute, contains `..` or a backslash, is too long or too deeply nested, or has a
+//! component that Windows can't store or that could mislead: a trailing dot or space, a reserved
+//! name such as `CON` or `com1`, a control character, one of `<>:"|?*`, or a bidirectional
+//! override. Use [`destination`] to turn an entry name into a path before writing it.
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 
+/// The longest entry name accepted, in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;
+/// The most components an entry name may have.
 pub const MAX_DEPTH: usize = 256;
 const MAX_COMPONENT_BYTES: usize = 255;
 
@@ -15,6 +23,15 @@ fn unsafe_entry(entry: &str, reason: &'static str) -> Error {
 }
 
 /// Shortens a name for display, since an entry name can be up to 64 KB.
+///
+/// Names over 256 characters are cut there and end with `…`.
+///
+/// ```
+/// use lazy_zip_core::safe_path::display_name;
+///
+/// assert_eq!(display_name("short.txt"), "short.txt");
+/// assert_eq!(display_name(&"a".repeat(1000)).chars().count(), 257);
+/// ```
 pub fn display_name(entry: &str) -> String {
     const MAX_CHARS: usize = 256;
     match entry.char_indices().nth(MAX_CHARS) {
@@ -26,6 +43,26 @@ pub fn display_name(entry: &str) -> String {
 /// Splits an entry name into its normalized path components, dropping empty and `.` segments.
 ///
 /// The same rules apply on every OS, so an archive behaves identically everywhere.
+///
+/// # Errors
+///
+/// [`Error::UnsafeEntry`] for any name the [module docs](self) describe as refused, and for a
+/// name with no components.
+///
+/// # Examples
+///
+/// ```
+/// use lazy_zip_core::safe_path::path_components;
+/// use lazy_zip_core::ErrorKind;
+///
+/// assert_eq!(path_components("a//./b/c.txt").unwrap(), ["a", "b", "c.txt"]);
+/// assert_eq!(path_components("folder/").unwrap(), ["folder"]);
+///
+/// for unsafe_name in ["../evil", "/etc/passwd", "C:\\evil", "dir/nul.txt", "what?.txt"] {
+///     let error = path_components(unsafe_name).unwrap_err();
+///     assert_eq!(error.kind(), ErrorKind::Unsafe);
+/// }
+/// ```
 pub fn path_components(entry: &str) -> Result<Vec<&str>> {
     if entry.len() > MAX_PATH_BYTES {
         return Err(unsafe_entry(entry, "path is too long"));
@@ -91,6 +128,32 @@ fn component_problem(component: &str) -> Option<&'static str> {
 }
 
 /// Computes where `entry` is written: under `root`, relative to the `base` directory in the archive.
+///
+/// An empty `base` keeps the whole name. The file system isn't touched, so pair this with
+/// [`ensure_within`] once the parent folder exists.
+///
+/// # Errors
+///
+/// [`Error::UnsafeEntry`] if `entry` or `base` is unsafe, or `entry` isn't inside `base`.
+///
+/// # Examples
+///
+/// ```
+/// use lazy_zip_core::safe_path::destination;
+/// use std::path::Path;
+///
+/// let root = Path::new("out");
+/// assert_eq!(
+///     destination(root, "", "data/2024/x.csv").unwrap(),
+///     root.join("data").join("2024").join("x.csv"),
+/// );
+/// assert_eq!(
+///     destination(root, "data", "data/2024/x.csv").unwrap(),
+///     root.join("2024").join("x.csv"),
+/// );
+/// assert!(destination(root, "data", "database/x.csv").is_err());
+/// assert!(destination(root, "", "data/../../evil").is_err());
+/// ```
 pub fn destination(root: &Path, base: &str, entry: &str) -> Result<PathBuf> {
     let components = path_components(entry)?;
     let base_components = if base.is_empty() {
@@ -109,6 +172,19 @@ pub fn destination(root: &Path, base: &str, entry: &str) -> Result<PathBuf> {
 }
 
 /// Checks that an existing directory resolves inside `root`, so a symlink on disk can't redirect a write.
+///
+/// # Errors
+///
+/// [`Error::UnsafeEntry`] if it resolves elsewhere, and [`Error::Io`] if either doesn't exist.
+///
+/// # Examples
+///
+/// ```
+/// use lazy_zip_core::safe_path::ensure_within;
+///
+/// let root = std::env::temp_dir();
+/// assert!(ensure_within(&root, &root).is_ok());
+/// ```
 pub fn ensure_within(root: &Path, directory: &Path) -> Result<()> {
     let root = root.canonicalize()?;
     let directory = directory.canonicalize()?;

@@ -1,23 +1,30 @@
-use crate::downloader::EntryCheck;
-use crate::error::{Error, Result};
-use crate::http_reader::RemoteHttpReader;
+//! Lists an archive as a tree of folders and files.
+//!
+//! [`scan`] builds the tree from an open [`RemoteArchive`] without making requests. Entries whose
+//! names aren't safe to write (see [`crate::safe_path`]), aren't valid UTF-8, or would make a file
+//! and a folder with the same name are left out and reported in [`ScanResult::rejected`]. Folders
+//! that only appear in file names are added. When names repeat, the last entry wins, as it does
+//! when downloading.
+
+use crate::archive::RemoteArchive;
 use crate::safe_path::{display_name, path_components};
-use async_zip::base::read::seek::ZipFileReader;
 use serde::Serialize;
 use std::collections::HashMap;
-use tokio::io::BufReader;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
 /// One row of the archive's tree. A parent always precedes its children in [`ScanResult::nodes`].
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct TreeNode {
     /// Index of the parent in [`ScanResult::nodes`].
     pub parent: Option<u32>,
+    /// The last component of the path.
     pub name: String,
     /// The entry's name in the archive for files, or the normalized path for directories.
     pub path: String,
+    /// The uncompressed size, or 0 for a directory.
     pub size: u64,
+    /// The compressed size, or 0 for a directory.
     pub compressed_size: u64,
+    /// Whether this is a directory.
     pub is_dir: bool,
     /// Number of files at or under this node.
     pub file_count: u64,
@@ -28,33 +35,77 @@ pub struct TreeNode {
 /// A nested view of the tree, for consumers that want one.
 #[derive(Serialize, Clone, Debug)]
 pub struct FileNode {
+    /// The last component of the path.
     pub name: String,
+    /// As in [`TreeNode::path`].
     pub path: String,
+    /// The uncompressed size, or 0 for a directory.
     pub size: u64,
+    /// The compressed size, or 0 for a directory.
     pub compressed_size: u64,
+    /// Whether this is a directory.
     pub is_dir: bool,
+    /// The node's children.
     pub children: Vec<FileNode>,
+    /// The parent's path, or `None` at the top level.
     pub parent_path: Option<String>,
 }
 
 /// An entry left out of the tree because it can't be written safely.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct RejectedEntry {
+    /// The entry's name, shortened for display.
     pub name: String,
+    /// Why it was left out.
     pub reason: String,
 }
 
+/// An archive's tree, made by [`scan`].
 #[derive(Serialize, Debug)]
 pub struct ScanResult {
+    /// Every folder and file, ordered by the entries' sorted names, with each parent before its
+    /// children.
     pub nodes: Vec<TreeNode>,
-    /// The first [`MAX_LISTED_REJECTIONS`] rejected entries.
+    /// The first 1000 rejected entries.
     pub rejected: Vec<RejectedEntry>,
+    /// How many entries were rejected in all.
     pub rejected_count: u64,
+    /// The archive's size in bytes.
     pub total_size: u64,
+    /// Bytes fetched to open the archive and read its directory.
     pub fetched_size: u64,
 }
 
 impl ScanResult {
+    /// The same tree, nested, in the same order as [`Self::nodes`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lazy_zip_core::zip_explorer::{ScanResult, TreeNode};
+    ///
+    /// let node = |parent, name: &str, path: &str, is_dir| TreeNode {
+    ///     parent,
+    ///     name: name.to_string(),
+    ///     path: path.to_string(),
+    ///     size: if is_dir { 0 } else { 10 },
+    ///     compressed_size: if is_dir { 0 } else { 5 },
+    ///     is_dir,
+    ///     file_count: 1,
+    ///     total_size: 10,
+    /// };
+    /// let result = ScanResult {
+    ///     nodes: vec![node(None, "docs", "docs", true), node(Some(0), "a.md", "docs/a.md", false)],
+    ///     rejected: Vec::new(),
+    ///     rejected_count: 0,
+    ///     total_size: 1000,
+    ///     fetched_size: 200,
+    /// };
+    ///
+    /// let tree = result.tree();
+    /// assert_eq!(tree[0].path, "docs");
+    /// assert_eq!(tree[0].children[0].parent_path.as_deref(), Some("docs"));
+    /// ```
     pub fn tree(&self) -> Vec<FileNode> {
         let mut children: Vec<Vec<FileNode>> = vec![Vec::new(); self.nodes.len()];
         let mut roots = Vec::new();
@@ -202,89 +253,47 @@ fn build_tree(mut entries: Vec<RawEntry>) -> TreeBuilder {
     builder
 }
 
-pub struct ZipExplorer {
-    pub reader: RemoteHttpReader,
-}
-
-impl ZipExplorer {
-    pub fn new(reader: RemoteHttpReader) -> Self {
-        Self { reader }
-    }
-
-    pub async fn list_files(&mut self) -> Result<ScanResult> {
-        // Wrap the reader in a BufReader and compat for async_zip
-        let reader = ZipFileReader::new(BufReader::new(&mut self.reader).compat()).await?;
-
-        let entries = reader
-            .file()
-            .entries()
-            .iter()
-            .map(|entry| {
-                let filename = entry.filename();
-                let name = String::from_utf8_lossy(filename.as_bytes()).into_owned();
-                let is_dir = entry.dir().unwrap_or(false) || name.ends_with('/');
-                RawEntry {
-                    invalid_utf8: filename.as_str().is_err(),
-                    size: entry.uncompressed_size(),
-                    compressed_size: entry.compressed_size(),
-                    is_dir,
-                    name,
-                }
-            })
-            .collect();
-        drop(reader);
-
-        let tree = build_tree(entries);
-
-        Ok(ScanResult {
-            nodes: tree.nodes,
-            rejected: tree.rejected,
-            rejected_count: tree.rejected_count,
-            total_size: self.reader.get_content_length(),
-            fetched_size: self.reader.get_network_bytes(),
+/// Lists the archive as a tree, leaving out entries that can't be written safely. This makes no
+/// requests.
+///
+/// ```no_run
+/// use lazy_zip_core::archive::RemoteArchive;
+/// use lazy_zip_core::http_reader::ReaderConfig;
+/// use lazy_zip_core::zip_explorer::scan;
+///
+/// # async fn example() -> lazy_zip_core::Result<()> {
+/// let archive = RemoteArchive::open("https://example.com/data.zip", ReaderConfig::new()?).await?;
+/// let result = scan(&archive);
+/// for node in &result.nodes {
+///     let depth = std::iter::successors(node.parent, |&p| result.nodes[p as usize].parent).count();
+///     println!("{}{} ({} files)", "  ".repeat(depth), node.name, node.file_count);
+/// }
+/// for rejected in &result.rejected {
+///     println!("left out {}: {}", rejected.name, rejected.reason);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub fn scan(archive: &RemoteArchive) -> ScanResult {
+    let entries = archive
+        .entries()
+        .iter()
+        .map(|entry| RawEntry {
+            invalid_utf8: entry.name().is_none(),
+            name: entry.lossy_name(),
+            size: entry.size,
+            compressed_size: entry.compressed_size,
+            is_dir: entry.is_dir,
         })
-    }
+        .collect();
+    let tree = build_tree(entries);
 
-    pub async fn get_file_stream(
-        self,
-        path: &str,
-    ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes>>> {
-        let path = path.to_string();
-        let fetch_limit = self.reader.fetch_limit();
-        let mut reader = ZipFileReader::new(BufReader::new(self.reader).compat()).await?;
-        fetch_limit.lift();
-
-        let index = reader
-            .file()
-            .entries()
-            .iter()
-            .rposition(|e| e.filename().as_str().unwrap_or("") == path)
-            .ok_or_else(|| Error::FileNotFound(path.clone()))?;
-        let entry = EntryCheck::new(&reader.file().entries()[index], &path)?;
-
-        // Use async-stream to create a stream that owns the reader
-        let stream = async_stream::try_stream! {
-            let entry_reader = reader.reader_without_entry(index).await?;
-            use tokio::io::AsyncReadExt;
-            use tokio_util::compat::FuturesAsyncReadCompatExt;
-            let mut compat_reader = entry_reader.compat();
-            let mut limited = (&mut compat_reader).take(entry.read_limit());
-
-            let mut buffer = vec![0u8; 262144]; // 256KB buffer
-            let mut total = 0;
-            loop {
-                let n = limited.read(&mut buffer).await.map_err(Error::from)?;
-                if n == 0 {
-                    break;
-                }
-                total += n as u64;
-                entry.check_size_so_far(total, &path)?;
-                yield bytes::Bytes::copy_from_slice(&buffer[..n]);
-            }
-            entry.check_finished(total, compat_reader.get_mut().compute_hash(), &path)?;
-        };
-
-        Ok(stream)
+    ScanResult {
+        nodes: tree.nodes,
+        rejected: tree.rejected,
+        rejected_count: tree.rejected_count,
+        total_size: archive.content_length(),
+        fetched_size: archive.fetched_size(),
     }
 }
 

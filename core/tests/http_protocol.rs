@@ -2,18 +2,24 @@
 
 mod support;
 
+use lazy_zip_core::archive::RemoteArchive;
+use lazy_zip_core::archive_limits::TAIL_BYTES;
 use lazy_zip_core::error::Error;
-use lazy_zip_core::http_reader::RemoteHttpReader;
-use lazy_zip_core::zip_explorer::{ScanResult, ZipExplorer};
+use lazy_zip_core::http_reader::{ReaderConfig, RemoteHttpReader};
+use lazy_zip_core::zip_explorer::{self, ScanResult};
 use std::io::SeekFrom;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+/// The default for [`ReaderConfig::chunk_bytes`].
+const DEFAULT_CHUNK_BYTES: u64 = 1024 * 1024;
+
 async fn scan(url: &str) -> Result<ScanResult, Error> {
     let reader = RemoteHttpReader::open(url, fast_config()).await?;
-    ZipExplorer::new(reader).list_files().await
+    let archive = RemoteArchive::from_reader(reader).await?;
+    Ok(zip_explorer::scan(&archive))
 }
 
 fn small_zip() -> Vec<u8> {
@@ -404,6 +410,369 @@ async fn reads_up_to_the_tail_without_fetching_it_again() {
     assert!(!tail_refetched, "{:?}", server.requests());
 }
 
+#[tokio::test]
+async fn a_limited_reader_stops_at_its_limit_and_fetches_nothing_past_it() {
+    let archive = large_directory_zip();
+    let server = serve(archive.clone()).await;
+    let mut config = fast_config();
+    config.chunk_bytes = 1000;
+    let mut reader = RemoteHttpReader::open(&server.url, config).await.unwrap();
+    let limit = 5500;
+    reader.limit_to(limit);
+
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).await.unwrap();
+
+    assert_eq!(data, archive[..limit as usize]);
+    let ranges: Vec<_> = server.requests()[1..]
+        .iter()
+        .map(|r| r.span().unwrap())
+        .collect();
+    assert_eq!(ranges.len(), 6, "{ranges:?}");
+    assert!(ranges.iter().all(|&(_, end)| end < limit), "{ranges:?}");
+    assert_eq!(ranges.last().unwrap().1, limit - 1);
+}
+
+/// Opens a reader whose fetch limit has been lifted, as it is once the directory has been parsed.
+async fn lifted_reader(server: &Server, config: ReaderConfig) -> RemoteHttpReader {
+    let reader = RemoteHttpReader::open(&server.url, config).await.unwrap();
+    reader.fetch_limit().lift();
+    reader
+}
+
+/// The ranges requested after the tail fetched at open.
+fn later_spans(server: &Server) -> Vec<(u64, u64)> {
+    server.requests()[1..]
+        .iter()
+        .map(|r| r.span().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_lifted_reader_streams_up_to_its_limit_in_one_request() {
+    let archive = large_directory_zip();
+    let tail_start = (archive.len() as u64) - TAIL_BYTES;
+    let server = serve(archive.clone()).await;
+    let mut config = fast_config();
+    config.chunk_bytes = 1000;
+    let mut reader = lifted_reader(&server, config).await;
+
+    reader.limit_to(5500);
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).await.unwrap();
+    reader.limit_to(u64::MAX);
+    reader.read_to_end(&mut data).await.unwrap();
+
+    assert_eq!(data, archive);
+    assert_eq!(later_spans(&server), [(0, 5499), (5500, tail_start - 1)]);
+}
+
+#[tokio::test]
+async fn seeking_to_the_current_position_keeps_the_stream() {
+    let archive = large_directory_zip();
+    let tail_start = (archive.len() as u64) - TAIL_BYTES;
+    let server = serve(archive.clone()).await;
+    let mut reader = lifted_reader(&server, fast_config()).await;
+
+    let mut start = vec![0u8; 600_000];
+    reader.read_exact(&mut start).await.unwrap();
+    reader.seek(SeekFrom::Start(600_000)).await.unwrap();
+    reader.seek(SeekFrom::Current(0)).await.unwrap();
+    let mut more = vec![0u8; 1000];
+    reader.read_exact(&mut more).await.unwrap();
+    assert_eq!(later_spans(&server), [(0, tail_start - 1)]);
+
+    reader.seek(SeekFrom::Start(10)).await.unwrap();
+    reader.read_exact(&mut more).await.unwrap();
+
+    assert_eq!(start, archive[..600_000]);
+    assert_eq!(more, archive[10..1010]);
+    assert_eq!(
+        later_spans(&server),
+        [(0, tail_start - 1), (10, tail_start - 1)]
+    );
+}
+
+#[tokio::test]
+async fn an_interrupted_stream_resumes_where_it_stopped_each_time() {
+    let archive = large_directory_zip();
+    // More interruptions than retries are allowed, but each one makes progress.
+    let server = serve_with(
+        archive.clone(),
+        Behavior {
+            truncate_gets: Some((1..5, 1000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut reader = lifted_reader(&server, fast_config()).await;
+    reader.limit_to(10_000);
+
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).await.unwrap();
+
+    assert_eq!(data, archive[..10_000]);
+    let starts: Vec<u64> = later_spans(&server).iter().map(|span| span.0).collect();
+    assert_eq!(starts, [0, 1000, 2000, 3000, 4000]);
+    assert!(later_spans(&server).iter().all(|span| span.1 == 9999));
+}
+
+#[tokio::test]
+async fn a_stream_failing_without_progress_gives_up_after_retrying() {
+    let server = serve_with(
+        large_directory_zip(),
+        Behavior {
+            truncate_gets: Some((1..100, 0)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut reader = lifted_reader(&server, fast_config()).await;
+
+    let mut data = vec![0u8; 64];
+    let error = Error::from(reader.read_exact(&mut data).await.unwrap_err());
+
+    assert!(matches!(error, Error::TruncatedResponse), "{error}");
+    assert_eq!(server.gets(), 1 + 3);
+}
+
+#[tokio::test]
+async fn a_stream_claiming_less_than_it_sends_is_refused_without_reading_it_all() {
+    let archive = large_directory_zip();
+    let tail_start = (archive.len() as u64) - TAIL_BYTES;
+    for no_content_length in [false, true] {
+        let server = serve_with(
+            archive.clone(),
+            Behavior {
+                overlong_body: Some((1, 600_000)),
+                no_content_length,
+                ..Default::default()
+            },
+        )
+        .await;
+        let config = fast_config();
+        let network = config.network_bytes.clone();
+        let mut reader = lifted_reader(&server, config).await;
+        let opened_with = network.load(Ordering::Relaxed);
+
+        let mut data = Vec::new();
+        let error = Error::from(reader.read_to_end(&mut data).await.unwrap_err());
+
+        assert!(matches!(error, Error::InvalidResponse(_)), "{error}");
+        assert_eq!(server.gets(), 2);
+        let used = network.load(Ordering::Relaxed) - opened_with;
+        if no_content_length {
+            assert!(used < tail_start, "used {used} bytes");
+        } else {
+            assert_eq!(used, 0, "refused before reading the body");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_file_changing_before_a_resumed_request_is_detected() {
+    let server = serve_with(
+        large_directory_zip(),
+        Behavior {
+            etag: Some("\"v1\""),
+            change_etag_after: Some(2),
+            truncate_gets: Some((1..2, 1000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut reader = lifted_reader(&server, fast_config()).await;
+
+    let mut data = Vec::new();
+    let error = Error::from(reader.read_to_end(&mut data).await.unwrap_err());
+
+    assert!(matches!(error, Error::RemoteChanged), "{error}");
+    assert_eq!(later_spans(&server)[1].0, 1000);
+    assert_eq!(server.gets(), 3);
+}
+
+#[tokio::test]
+async fn a_stalled_stream_times_out_and_resumes() {
+    let archive = large_directory_zip();
+    let server = serve_with(
+        archive.clone(),
+        Behavior {
+            stall_body: Some((1, 5000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut reader = lifted_reader(&server, fast_config()).await;
+
+    let mut data = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut data))
+        .await
+        .expect("the read timeout should end the stall")
+        .unwrap();
+
+    assert_eq!(data, archive);
+    assert_eq!(later_spans(&server)[1].0, 5000);
+}
+
+#[tokio::test]
+async fn a_stalled_stream_fails_when_no_retries_are_left() {
+    let server = serve_with(
+        large_directory_zip(),
+        Behavior {
+            stall_body: Some((1, 5000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut config = fast_config();
+    config.retry.max_attempts = 1;
+    let mut reader = lifted_reader(&server, config).await;
+
+    let mut data = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut data))
+        .await
+        .expect("the read timeout should end the stall");
+
+    let error = Error::from(result.unwrap_err());
+    assert!(matches!(error, Error::Http(_)), "{error}");
+    assert_eq!(data.len(), 5000);
+    assert_eq!(server.gets(), 2);
+}
+
+/// A reader config with `headers` that fails fast.
+fn config_with_headers(headers: &[(&str, &str)]) -> ReaderConfig {
+    let mut config = ReaderConfig::with_headers(headers.iter().copied()).unwrap();
+    config.retry = fast_config().retry;
+    config
+}
+
+#[tokio::test]
+async fn custom_headers_are_sent_with_every_request() {
+    let server = serve_with(
+        large_directory_zip(),
+        Behavior {
+            truncate_gets: Some((1..2, 1000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let config = config_with_headers(&[("X-Token", " secret "), ("Authorization", "Bearer t")]);
+    let mut reader = lifted_reader(&server, config).await;
+
+    let mut data = vec![0u8; 5000];
+    reader.read_exact(&mut data).await.unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    for request in &requests {
+        assert_eq!(request.header("x-token"), Some("secret"), "{request:?}");
+        assert_eq!(request.header("authorization"), Some("Bearer t"));
+    }
+}
+
+#[tokio::test]
+async fn headers_the_client_sets_itself_are_refused() {
+    for name in ["Range", "accept-encoding", " ACCEPT-ENCODING "] {
+        let result = ReaderConfig::with_headers([(name, "x")]);
+        assert!(
+            matches!(result.err(), Some(Error::InvalidHeader(ref n)) if n == name),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_header_names_and_values_are_refused() {
+    let invalid = [
+        ("bad name", "x"),
+        ("", "x"),
+        ("X-Bad:", "x"),
+        ("X-Token", "line\nbreak"),
+        ("X-Token", "null\0byte"),
+    ];
+    for (name, value) in invalid {
+        let result = ReaderConfig::with_headers([(name, value)]);
+        assert!(
+            matches!(result.err(), Some(Error::InvalidHeader(_))),
+            "{name:?}: {value:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_site_is_refused_when_custom_headers_are_set() {
+    let other_site = serve(small_zip()).await;
+    let server = serve_with(
+        small_zip(),
+        Behavior {
+            redirect_to: Some(other_site.url.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let config = config_with_headers(&[("X-Token", "secret")]);
+    let error = match RemoteHttpReader::open(&server.url, config).await {
+        Err(error) => error,
+        Ok(_) => panic!("expected an error"),
+    };
+
+    assert!(
+        error.to_string().contains("redirected to another site"),
+        "{error}"
+    );
+    assert_eq!(other_site.gets(), 0);
+    assert_eq!(server.gets(), 1);
+}
+
+#[tokio::test]
+async fn a_redirect_within_the_same_site_keeps_custom_headers() {
+    let server = serve_with(
+        small_zip(),
+        Behavior {
+            redirect_to: Some("/moved.zip".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let config = config_with_headers(&[("X-Token", "secret")]);
+    let reader = RemoteHttpReader::open(&server.url, config).await.unwrap();
+    let archive = RemoteArchive::from_reader(reader).await.unwrap();
+
+    assert_eq!(zip_explorer::scan(&archive).nodes.len(), 3);
+    let requests = server.requests();
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["/test.zip", "/moved.zip"]);
+    assert!(requests
+        .iter()
+        .all(|r| r.header("x-token") == Some("secret")));
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_site_drops_authorization_instead_of_failing() {
+    let other_site = serve(small_zip()).await;
+    let server = serve_with(
+        small_zip(),
+        Behavior {
+            redirect_to: Some(other_site.url.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let config = config_with_headers(&[("Authorization", "Bearer secret")]);
+    RemoteHttpReader::open(&server.url, config).await.unwrap();
+
+    assert_eq!(
+        server.requests()[0].header("authorization"),
+        Some("Bearer secret")
+    );
+    let followed = other_site.requests();
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0].header("authorization"), None);
+}
+
 // Regression budgets for the product's core promise. They count bytes, so they aren't flaky.
 
 #[tokio::test]
@@ -421,12 +790,13 @@ async fn listing_stays_cheap() {
     let config = fast_config();
     let network = config.network_bytes.clone();
     let reader = RemoteHttpReader::open(&server.url, config).await.unwrap();
-    let result = ZipExplorer::new(reader).list_files().await.unwrap();
+    let archive = RemoteArchive::from_reader(reader).await.unwrap();
+    let result = zip_explorer::scan(&archive);
 
     assert_eq!(result.nodes.len(), 5002);
     let used = network.load(Ordering::Relaxed);
     assert!(used < 2 * 1024 * 1024, "listing used {used} bytes");
-    assert!(server.gets() <= 4, "{}", server.gets());
+    assert_eq!(server.gets(), 2, "{:?}", server.requests());
     assert_eq!(result.fetched_size, used);
     assert!(directory_bytes > 0 && (used as usize) < padded.len() / 50);
 }
@@ -451,4 +821,130 @@ async fn directory_parsing_cannot_fetch_without_limit() {
         "{}",
         server.body_bytes()
     );
+}
+
+/// Enough entries with long names for a directory of several chunks.
+fn many_long_names() -> Vec<Entry> {
+    (0..30_000)
+        .map(|i| {
+            let name =
+                format!("folder/an-entry-whose-name-is-long-enough-to-fill-chunks-{i:05}.txt");
+            stored(&name, "x")
+        })
+        .collect()
+}
+
+/// Lists the archive, returning the result and the bytes received.
+async fn list_counting(server: &Server, config: ReaderConfig) -> (Result<ScanResult, Error>, u64) {
+    let network = config.network_bytes.clone();
+    let result = async {
+        let reader = RemoteHttpReader::open(&server.url, config).await?;
+        let archive = RemoteArchive::from_reader(reader).await?;
+        Ok(zip_explorer::scan(&archive))
+    }
+    .await;
+    (result, network.load(Ordering::Relaxed))
+}
+
+#[tokio::test]
+async fn a_directory_larger_than_a_chunk_is_fetched_in_one_request() {
+    let archive = build_zip(&many_long_names());
+    let (_, size, offset) = end_record(&archive);
+    let (len, offset) = (archive.len() as u64, u64::from(offset));
+    assert!(u64::from(size) > 3 * DEFAULT_CHUNK_BYTES);
+    let server = serve(archive).await;
+
+    let (result, used) = list_counting(&server, fast_config()).await;
+
+    assert_eq!(result.unwrap().nodes.len(), 30_001);
+    assert_eq!(later_spans(&server), [(offset, len - TAIL_BYTES - 1)]);
+    assert_eq!(used, len - offset);
+}
+
+#[tokio::test]
+async fn a_zip64_directory_is_fetched_in_one_request() {
+    let entries = many_long_names();
+    let offset: u64 = entries.iter().map(local_span).sum();
+    let archive = build_zip64(&entries);
+    let len = archive.len() as u64;
+    let server = serve(archive).await;
+
+    let (result, used) = list_counting(&server, fast_config()).await;
+
+    let result = result.unwrap();
+    assert_eq!(result.nodes.len(), 30_001);
+    assert!(result
+        .nodes
+        .iter()
+        .any(|node| node.path.ends_with("-29999.txt")));
+    assert_eq!(later_spans(&server), [(offset, len - TAIL_BYTES - 1)]);
+    assert_eq!(used, len - offset);
+}
+
+#[tokio::test]
+async fn records_past_the_claimed_directory_size_are_fetched_in_chunks() {
+    let mut archive = build_zip(&many_long_names());
+    let (entries, size, offset) = end_record(&archive);
+    set_end_record(&mut archive, entries, size / 2, offset);
+    let (len, offset, claimed) = (archive.len() as u64, u64::from(offset), u64::from(size / 2));
+    let server = serve(archive).await;
+    let mut config = fast_config();
+    config.chunk_bytes = 256 * 1024;
+
+    let (result, used) = list_counting(&server, config).await;
+
+    assert_eq!(result.unwrap().nodes.len(), 30_001);
+    let spans = later_spans(&server);
+    assert_eq!(spans[0], (offset, offset + claimed - 1));
+    for pair in spans.windows(2) {
+        assert_eq!(pair[1].0, pair[0].1 + 1, "{spans:?}");
+        assert!(pair[1].1 - pair[1].0 < 256 * 1024, "{spans:?}");
+    }
+    assert_eq!(spans.last().unwrap().1, len - TAIL_BYTES - 1);
+    assert_eq!(used, len - offset);
+}
+
+#[tokio::test]
+async fn claiming_more_records_than_there_are_fails_without_fetching_more() {
+    let mut archive = build_zip(&many_long_names());
+    let (entries, _, offset) = end_record(&archive);
+    set_end_record(&mut archive, entries + 1000, 400 * 1024 * 1024, offset);
+    let (len, offset) = (archive.len() as u64, u64::from(offset));
+    let server = serve(archive).await;
+
+    let (result, used) = list_counting(&server, fast_config()).await;
+
+    assert!(result.is_err());
+    assert_eq!(later_spans(&server), [(offset, len - TAIL_BYTES - 1)]);
+    assert_eq!(used, len - offset);
+}
+
+#[tokio::test]
+async fn a_lying_directory_size_is_abandoned_at_the_first_bad_record() {
+    let mut archive = vec![b'x'; 8 * 1024 * 1024];
+    archive.extend_from_slice(&[0; 22]);
+    set_end_record(&mut archive, 1000, 400 * 1024 * 1024, 0);
+    let at = archive.len() - 22;
+    archive[at..at + 4].copy_from_slice(b"PK\x05\x06");
+    let server = serve(archive).await;
+
+    let (result, used) = list_counting(&server, fast_config()).await;
+
+    assert!(result.is_err());
+    assert_eq!(server.gets(), 2, "{:?}", server.requests());
+    assert!(used < TAIL_BYTES + DEFAULT_CHUNK_BYTES, "used {used} bytes");
+}
+
+#[tokio::test]
+async fn a_directory_offset_pointing_into_file_data_fails_at_the_first_record() {
+    let mut archive = build_zip(&many_long_names());
+    let (entries, size, offset) = end_record(&archive);
+    set_end_record(&mut archive, entries, size, offset - 1_000_000);
+    let server = serve(archive).await;
+
+    let (result, used) = list_counting(&server, fast_config()).await;
+
+    assert!(result.is_err());
+    assert_eq!(server.gets(), 2, "{:?}", server.requests());
+    assert!(used < TAIL_BYTES + DEFAULT_CHUNK_BYTES, "used {used} bytes");
 }

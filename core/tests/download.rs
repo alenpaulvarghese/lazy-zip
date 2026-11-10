@@ -2,11 +2,14 @@
 
 mod support;
 
+use lazy_zip_core::archive::RemoteArchive;
+use lazy_zip_core::archive_limits::TAIL_BYTES;
 use lazy_zip_core::downloader::{
-    download_batch, find_existing, plan_selection, BatchEvent, BatchFile, BatchOptions, BatchReport,
+    download_batch, download_from, find_existing, plan_selection, BatchEvent, BatchFile,
+    BatchOptions, BatchReport,
 };
-use lazy_zip_core::http_reader::RemoteHttpReader;
-use lazy_zip_core::zip_explorer::{ScanResult, ZipExplorer};
+use lazy_zip_core::http_reader::{ReaderConfig, RemoteHttpReader};
+use lazy_zip_core::zip_explorer::{self, ScanResult};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -16,7 +19,22 @@ use tokio_util::sync::CancellationToken;
 
 async fn scan(url: &str) -> ScanResult {
     let reader = RemoteHttpReader::open(url, fast_config()).await.unwrap();
-    ZipExplorer::new(reader).list_files().await.unwrap()
+    let archive = RemoteArchive::from_reader(reader).await.unwrap();
+    zip_explorer::scan(&archive)
+}
+
+/// Many tiny files followed by one big enough that none of them is in the fetched tail.
+fn small_files_and_one_big_file() -> Vec<Entry> {
+    let mut entries: Vec<Entry> = (0..200)
+        .map(|i| stored(&format!("small/{i}.txt"), format!("file {i}")))
+        .collect();
+    entries.push(stored("big.bin", vec![0u8; 50 * 1024 * 1024]));
+    entries
+}
+
+/// Where `entries[index]`'s local header starts in an archive built from `entries`.
+fn header_offset(entries: &[Entry], index: usize) -> u64 {
+    entries[..index].iter().map(local_span).sum()
 }
 
 fn options(root: Option<&Path>) -> BatchOptions {
@@ -34,6 +52,16 @@ async fn download_selection(
     base: &str,
     files: &[&str],
 ) -> (BatchReport, Vec<(String, String)>) {
+    download_selection_with(url, root, base, files, fast_config()).await
+}
+
+async fn download_selection_with(
+    url: &str,
+    root: &Path,
+    base: &str,
+    files: &[&str],
+    reader: ReaderConfig,
+) -> (BatchReport, Vec<(String, String)>) {
     let plan = plan_selection(
         root,
         base,
@@ -41,8 +69,12 @@ async fn download_selection(
     );
     assert!(plan.rejected.is_empty(), "{:?}", plan.rejected);
     let failures = Mutex::new(Vec::new());
-    let report = download_batch(url, plan.files, options(Some(root)), |event| {
-        if let BatchEvent::FileFailed { path, error } = event {
+    let batch_options = BatchOptions {
+        reader,
+        ..options(Some(root))
+    };
+    let report = download_batch(url, plan.files, batch_options, |event| {
+        if let BatchEvent::FileFailed { path, error, .. } = event {
             failures.lock().unwrap().push((path.to_string(), error));
         }
     })
@@ -141,7 +173,7 @@ async fn failed_download_keeps_the_existing_file_and_leaves_no_partial() {
     let big = vec![7u8; 3 * 1024 * 1024];
     let url = serve_with(
         build_zip(&[stored("big.bin", big)]),
-        // Enough for the end of the file and the first chunk of the entry, but not the rest.
+        // Enough for the end of the file and the entry's local header, but not the rest.
         Behavior {
             fail_after: Some((2, 503)),
             ..Default::default()
@@ -205,6 +237,22 @@ async fn cancelling_stops_the_job_and_removes_partial_files() {
 }
 
 #[tokio::test]
+async fn batches_can_run_as_spawned_tasks() {
+    let url = serve(build_zip(&[stored("a.txt", "a")])).await.url;
+    let out = tempfile::tempdir().unwrap();
+    let files = vec![BatchFile {
+        zip_path: "a.txt".to_string(),
+        dest: out.path().join("a.txt"),
+        index: None,
+    }];
+    let report =
+        tokio::spawn(async move { download_batch(&url, files, options(None), |_| {}).await })
+            .await
+            .unwrap();
+    assert_eq!(report.completed, 1);
+}
+
+#[tokio::test]
 async fn zero_concurrency_does_not_hang() {
     let url = serve(build_zip(&[stored("a.txt", "a")])).await.url;
     let out = tempfile::tempdir().unwrap();
@@ -215,6 +263,7 @@ async fn zero_concurrency_does_not_hang() {
     let files = vec![BatchFile {
         zip_path: "a.txt".to_string(),
         dest: out.path().join("a.txt"),
+        index: None,
     }];
 
     let report = tokio::time::timeout(
@@ -294,13 +343,17 @@ async fn deflated_files_are_decompressed_and_verified() {
 
 async fn download_expecting_failure(entry: Entry) -> String {
     let name = entry.name.clone();
-    let url = serve(build_zip(&[entry])).await.url;
+    download_one_expecting_failure(&[entry], &name).await
+}
+
+async fn download_one_expecting_failure(entries: &[Entry], name: &str) -> String {
+    let url = serve(build_zip(entries)).await.url;
     let out = tempfile::tempdir().unwrap();
-    std::fs::write(out.path().join(&name), b"good copy").unwrap();
-    let (report, failures) = download_selection(&url, out.path(), "", &[name.as_str()]).await;
+    std::fs::write(out.path().join(name), b"good copy").unwrap();
+    let (report, failures) = download_selection(&url, out.path(), "", &[name]).await;
     assert_eq!((report.completed, report.failed), (0, 1), "{failures:?}");
     assert_eq!(
-        std::fs::read(out.path().join(&name)).unwrap(),
+        std::fs::read(out.path().join(name)).unwrap(),
         b"good copy",
         "an existing file must survive a failed download"
     );
@@ -360,25 +413,377 @@ async fn a_server_failing_mid_batch_reports_each_file() {
     let out = tempfile::tempdir().unwrap();
     let (report, failures) = download_selection(&url, out.path(), "", &["a.txt", "b.txt"]).await;
     assert_eq!(report.failed, 2);
-    assert!(failures[0].1.contains("404"), "{failures:?}");
+    assert_eq!(failures.len(), 2);
+    assert!(
+        failures.iter().all(|(_, error)| error.contains("404")),
+        "{failures:?}"
+    );
 }
 
 #[tokio::test]
 async fn a_single_download_stays_within_its_byte_budget() {
-    let mut entries: Vec<Entry> = (0..200)
-        .map(|i| stored(&format!("small/{i}.txt"), "x"))
-        .collect();
-    entries.push(stored("big.bin", vec![0u8; 50 * 1024 * 1024]));
-    let server = serve(build_zip(&entries)).await;
+    let server = serve(build_zip(&small_files_and_one_big_file())).await;
     let out = tempfile::tempdir().unwrap();
     let (report, _) = download_selection(&server.url, out.path(), "", &["small/7.txt"]).await;
     assert_eq!(report.completed, 1);
-    // The end of the file, plus at most one fixed-size chunk for the entry.
+    // The end of the file, plus the entry's own few bytes.
     assert!(
-        report.network_bytes < 1024 * 1024 + 128 * 1024,
+        report.network_bytes < TAIL_BYTES + 4 * 1024,
         "used {} bytes",
         report.network_bytes
     );
+    assert_eq!(server.gets(), 2, "{:?}", server.requests());
+    assert_eq!(
+        std::fs::read(out.path().join("small/7.txt")).unwrap(),
+        b"file 7"
+    );
+}
+
+#[tokio::test]
+async fn several_files_cost_the_tail_plus_their_own_bytes() {
+    let entries = small_files_and_one_big_file();
+    let server = serve(build_zip(&entries)).await;
+    let out = tempfile::tempdir().unwrap();
+    let selected: Vec<String> = (10..20).map(|i| format!("small/{i}.txt")).collect();
+    let names: Vec<&str> = selected.iter().map(String::as_str).collect();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &names).await;
+
+    assert_eq!(failures, []);
+    assert_eq!(report.completed, 10);
+    let entry_bytes: u64 = entries[10..20].iter().map(local_span).sum();
+    assert_eq!(report.network_bytes, TAIL_BYTES + entry_bytes);
+    // One request for the tail, which holds the directory, then one per file and nothing else.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 11, "{requests:?}");
+    let mut starts: Vec<u64> = requests[1..].iter().map(|r| r.span().unwrap().0).collect();
+    starts.sort_unstable();
+    let expected: Vec<u64> = (10..20).map(|i| header_offset(&entries, i)).collect();
+    assert_eq!(starts, expected);
+    for i in 10..20 {
+        let path = out.path().join(format!("small/{i}.txt"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), format!("file {i}"));
+    }
+}
+
+#[tokio::test]
+async fn an_open_archive_downloads_without_reading_its_directory_again() {
+    let entries = small_files_and_one_big_file();
+    let server = serve(build_zip(&entries)).await;
+    let archive = RemoteArchive::open(&server.url, fast_config())
+        .await
+        .unwrap();
+    let opened_with = server.requests().len();
+    let out = tempfile::tempdir().unwrap();
+
+    for (round, index) in [3, 150].into_iter().enumerate() {
+        let plan = plan_selection(out.path(), "", vec![format!("small/{index}.txt")]);
+        let report = download_from(&archive, plan.files, options(Some(out.path())), |_| {}).await;
+
+        assert_eq!((report.completed, report.failed), (1, 0));
+        assert_eq!(report.network_bytes, local_span(&entries[index]));
+        let later = &server.requests()[opened_with + round..];
+        assert_eq!(later.len(), 1, "{later:?}");
+        assert_eq!(later[0].body_bytes as u64, report.network_bytes);
+        assert_eq!(
+            later[0].span().unwrap(),
+            (
+                header_offset(&entries, index),
+                header_offset(&entries, index + 1) - 1
+            )
+        );
+    }
+    assert_eq!(
+        archive.network_counter().load(Ordering::Relaxed),
+        archive.fetched_size()
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("small/150.txt")).unwrap(),
+        b"file 150"
+    );
+}
+
+#[tokio::test]
+async fn a_file_larger_than_one_request_downloads_without_reading_past_it() {
+    let big: Vec<u8> = (0..3 * 1024 * 1024 + 123)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let entries = [
+        stored("big.bin", big.clone()),
+        stored("after.bin", vec![1u8; 256 * 1024]),
+    ];
+    let server = serve(build_zip(&entries)).await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["big.bin"]).await;
+
+    assert_eq!(failures, []);
+    assert_eq!(std::fs::read(out.path().join("big.bin")).unwrap(), big);
+    let next_header = header_offset(&entries, 1);
+    assert_eq!(report.network_bytes, TAIL_BYTES + next_header);
+    // The tail, the entry's local header, then the rest of it.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|r| r.span().unwrap().1 < next_header),
+        "{requests:?}"
+    );
+}
+
+/// A large stored file followed by another, so neither is in the fetched tail.
+fn large_file_entries() -> [Entry; 2] {
+    let big: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    [
+        stored("big.bin", big),
+        stored("after.bin", vec![1u8; 256 * 1024]),
+    ]
+}
+
+/// The first request for an entry, which holds its local header.
+const FIRST_SPAN: (u64, u64) = (0, 64 * 1024 - 1);
+
+#[tokio::test]
+async fn a_large_file_downloads_with_one_request_after_its_header() {
+    let entries = large_file_entries();
+    let server = serve(build_zip(&entries)).await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["big.bin"]).await;
+
+    assert_eq!(failures, []);
+    assert_eq!(
+        std::fs::read(out.path().join("big.bin")).unwrap(),
+        entries[0].contents
+    );
+    // The tail, the first 64 KiB with the local header, then all the rest in one request.
+    let next_header = header_offset(&entries, 1);
+    let spans: Vec<_> = server.requests()[1..]
+        .iter()
+        .map(|r| r.span().unwrap())
+        .collect();
+    assert_eq!(spans, [FIRST_SPAN, (FIRST_SPAN.1 + 1, next_header - 1)]);
+    assert_eq!(report.network_bytes, TAIL_BYTES + next_header);
+}
+
+#[tokio::test]
+async fn an_interrupted_download_resumes_where_it_stopped() {
+    let entries = large_file_entries();
+    let received = 1_000_000;
+    let server = serve_with(
+        build_zip(&entries),
+        Behavior {
+            truncate_gets: Some((2..3, received)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["big.bin"]).await;
+
+    assert_eq!(failures, []);
+    assert_eq!(
+        std::fs::read(out.path().join("big.bin")).unwrap(),
+        entries[0].contents
+    );
+    let next_header = header_offset(&entries, 1);
+    let data_start = FIRST_SPAN.1 + 1;
+    let spans: Vec<_> = server.requests()[1..]
+        .iter()
+        .map(|r| r.span().unwrap())
+        .collect();
+    assert_eq!(
+        spans,
+        [
+            FIRST_SPAN,
+            (data_start, next_header - 1),
+            (data_start + received as u64, next_header - 1)
+        ]
+    );
+    assert_eq!(report.network_bytes, TAIL_BYTES + next_header);
+}
+
+#[tokio::test]
+async fn an_archive_changing_before_a_download_resumes_fails_it() {
+    let entries = large_file_entries();
+    let server = serve_with(
+        build_zip(&entries),
+        Behavior {
+            etag: Some("\"v1\""),
+            change_etag_after: Some(3),
+            truncate_gets: Some((2..3, 1_000_000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["big.bin"]).await;
+
+    assert_eq!((report.completed, report.failed), (0, 1));
+    assert!(failures[0].1.contains("changed"), "{failures:?}");
+    assert_eq!(server.gets(), 4);
+    assert_eq!(dir_entries(out.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_download_longer_than_promised_is_refused_without_buffering_it() {
+    let entries = large_file_entries();
+    let server = serve_with(
+        build_zip(&entries),
+        Behavior {
+            overlong_body: Some((2, 4 * 1024 * 1024)),
+            no_content_length: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["big.bin"]).await;
+
+    assert_eq!((report.completed, report.failed), (0, 1));
+    assert!(failures[0].1.contains("more data"), "{failures:?}");
+    let sent = server.body_bytes() as u64;
+    assert!(
+        report.network_bytes + 2 * 1024 * 1024 < sent,
+        "received {} of {sent} bytes",
+        report.network_bytes
+    );
+    assert_eq!(dir_entries(out.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_stalled_download_times_out_and_resumes() {
+    let entries = large_file_entries();
+    let received = 100_000;
+    let server = serve_with(
+        build_zip(&entries),
+        Behavior {
+            stall_body: Some((2, received)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["big.bin"]).await;
+
+    assert_eq!(failures, []);
+    assert_eq!(report.completed, 1);
+    let starts: Vec<u64> = server.requests()[1..]
+        .iter()
+        .map(|r| r.span().unwrap().0)
+        .collect();
+    let data_start = FIRST_SPAN.1 + 1;
+    assert_eq!(starts, [0, data_start, data_start + received as u64]);
+}
+
+#[tokio::test]
+async fn a_stalled_download_fails_when_no_retries_are_left() {
+    let server = serve_with(
+        build_zip(&large_file_entries()),
+        Behavior {
+            stall_body: Some((2, 100_000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let mut config = fast_config();
+    config.retry.max_attempts = 1;
+
+    let (report, failures) =
+        download_selection_with(&server.url, out.path(), "", &["big.bin"], config).await;
+
+    assert_eq!((report.completed, report.failed), (0, 1));
+    assert!(failures[0].1.contains("Network error"), "{failures:?}");
+    assert_eq!(server.gets(), 3);
+    assert_eq!(dir_entries(out.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn files_inside_the_fetched_tail_need_no_more_requests() {
+    let archive = build_zip(&[stored("a.txt", "hello"), deflated("b.txt", "world")]);
+    let server = serve(archive.clone()).await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) =
+        download_selection(&server.url, out.path(), "", &["a.txt", "b.txt"]).await;
+
+    assert_eq!(failures, []);
+    assert_eq!(report.completed, 2);
+    assert_eq!(server.gets(), 1, "{:?}", server.requests());
+    assert_eq!(report.network_bytes, archive.len() as u64);
+    assert_eq!(std::fs::read(out.path().join("b.txt")).unwrap(), b"world");
+}
+
+#[tokio::test]
+async fn a_local_header_naming_another_file_is_refused() {
+    let mut entry = stored("good.txt", "hello");
+    entry.local_name = Some("evil.txt".to_string());
+    let error = download_expecting_failure(entry).await;
+    assert!(
+        error.contains("its local header names a different file"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn entries_sharing_a_local_header_are_refused() {
+    let mut second = stored("b.txt", "bbbb");
+    second.header_offset = Some(0);
+    let entries = [stored("a.txt", "aaaa"), second];
+    for name in ["a.txt", "b.txt"] {
+        let error = download_one_expecting_failure(&entries, name).await;
+        assert!(error.contains("overlaps"), "{name}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn an_entry_whose_data_runs_into_the_next_one_is_refused() {
+    let mut first = stored("a.txt", vec![b'a'; 100]);
+    first.declared_size = Some(1000);
+    first.declared_compressed_size = Some(1000);
+    let entries = [first, stored("b.txt", vec![b'b'; 2000])];
+    let error = download_one_expecting_failure(&entries, "a.txt").await;
+    assert!(error.contains("overlaps"), "{error}");
+}
+
+#[tokio::test]
+async fn an_entry_whose_data_runs_into_the_directory_is_refused() {
+    let mut entry = stored("a.txt", vec![b'a'; 100]);
+    entry.declared_size = Some(200);
+    entry.declared_compressed_size = Some(200);
+    let error = download_expecting_failure(entry).await;
+    assert!(error.contains("overlaps"), "{error}");
+}
+
+#[tokio::test]
+async fn an_encrypted_entry_is_refused_without_downloading_it() {
+    let mut secret = stored("secret.bin", vec![9u8; 4 * 1024 * 1024]);
+    secret.encrypted = true;
+    let server = serve(build_zip(&[
+        secret,
+        stored("after.bin", vec![0u8; 128 * 1024]),
+    ]))
+    .await;
+    let out = tempfile::tempdir().unwrap();
+
+    let (report, failures) = download_selection(&server.url, out.path(), "", &["secret.bin"]).await;
+
+    assert_eq!((report.completed, report.failed), (0, 1));
+    assert!(failures[0].1.contains("encrypted"), "{failures:?}");
+    // Only the small first request, which holds the local header.
+    assert!(
+        report.network_bytes <= TAIL_BYTES + 64 * 1024,
+        "used {} bytes",
+        report.network_bytes
+    );
+    assert_eq!(server.gets(), 2, "{:?}", server.requests());
+    assert_eq!(dir_entries(out.path()), Vec::<String>::new());
 }
 
 #[tokio::test]

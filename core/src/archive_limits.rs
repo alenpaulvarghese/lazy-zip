@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 
 /// The most data read while parsing the directory, and the largest directory accepted.
 pub const MAX_DIRECTORY_BYTES: u64 = 512 * 1024 * 1024;
+/// The most entries an archive may claim.
 pub const MAX_ENTRIES: u64 = 5_000_000;
 
 const EOCD_SIGNATURE: &[u8] = b"PK\x05\x06";
@@ -17,11 +18,14 @@ const ZIP64_LOCATOR_SIGNATURE: &[u8] = b"PK\x06\x07";
 const ZIP64_LOCATOR_LENGTH: usize = 20;
 const ZIP64_RECORD_LENGTH: usize = 56;
 const MIN_DIRECTORY_RECORD_LENGTH: u64 = 46;
+/// A record's name, extra field and comment are each at most `u16::MAX` bytes long.
+const MAX_DIRECTORY_RECORD_LENGTH: u64 = MIN_DIRECTORY_RECORD_LENGTH + 3 * u16::MAX as u64;
 
 /// The parser searches backwards in steps this long, so it can look this far past the records.
 const PARSER_SEARCH_STEP: usize = 2048;
 
 /// Enough of the end of a file to contain all of the end records and the parser's search for them.
+/// Opening an archive fetches this much of its end, about 66 KiB.
 pub const TAIL_BYTES: u64 = (EOCD_LENGTH
     + MAX_COMMENT_LENGTH
     + ZIP64_LOCATOR_LENGTH
@@ -42,8 +46,68 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(value)
 }
 
-/// Validates the directory claimed by `tail`, the last bytes of a file `file_len` bytes long.
-pub fn check_directory(tail: &[u8], file_len: u64) -> Result<()> {
+/// The directory as claimed by end records that passed the checks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DirectoryClaim {
+    pub offset: u64,
+    pub size: u64,
+    pub entries: u64,
+}
+
+impl DirectoryClaim {
+    /// Where the directory's records end, if the claim is true. A size larger than the claimed
+    /// number of records could fill is ignored.
+    pub fn end(&self) -> u64 {
+        let most = self.entries.saturating_mul(MAX_DIRECTORY_RECORD_LENGTH);
+        self.offset.saturating_add(self.size.min(most))
+    }
+}
+
+/// Validates the directory claimed by `tail`, the last bytes of a file `file_len` bytes long, and
+/// returns where it starts.
+///
+/// `tail` should be the last [`TAIL_BYTES`] of the file, or all of it if it's shorter.
+///
+/// # Errors
+///
+/// [`Error::NotAZip`] if there's no usable end record, and [`Error::LimitExceeded`] if the
+/// records claim more than [`MAX_ENTRIES`] entries or a directory over [`MAX_DIRECTORY_BYTES`].
+///
+/// # Examples
+///
+/// ```
+/// use lazy_zip_core::archive_limits::check_directory;
+/// use lazy_zip_core::ErrorKind;
+///
+/// // An end of central directory record, without a comment.
+/// fn end_record(entries: u16, directory_size: u32, directory_offset: u32) -> Vec<u8> {
+///     let mut record = b"PK\x05\x06".to_vec();
+///     record.extend_from_slice(&[0; 4]); // disk numbers
+///     record.extend_from_slice(&entries.to_le_bytes()); // entries on this disk
+///     record.extend_from_slice(&entries.to_le_bytes()); // entries in total
+///     record.extend_from_slice(&directory_size.to_le_bytes());
+///     record.extend_from_slice(&directory_offset.to_le_bytes());
+///     record.extend_from_slice(&0u16.to_le_bytes()); // comment length
+///     record
+/// }
+///
+/// // The last 42 bytes of a 168-byte archive whose one-entry directory starts at byte 100.
+/// let mut tail = vec![0u8; 20];
+/// tail.extend_from_slice(&end_record(1, 46, 100));
+/// assert_eq!(check_directory(&tail, 168).unwrap(), 100);
+///
+/// // A directory of 600 MiB is refused before anything allocates it.
+/// let mut tail = vec![0u8; 20];
+/// tail.extend_from_slice(&end_record(1, 600 << 20, 100));
+/// let error = check_directory(&tail, 1 << 30).unwrap_err();
+/// assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+/// ```
+pub fn check_directory(tail: &[u8], file_len: u64) -> Result<u64> {
+    check_end_records(tail, file_len).map(|claim| claim.offset)
+}
+
+/// Like [`check_directory`], returning everything the end records claim about the directory.
+pub(crate) fn check_end_records(tail: &[u8], file_len: u64) -> Result<DirectoryClaim> {
     // The parser takes the last signature in the file, so this must too.
     let eocd = tail
         .windows(EOCD_SIGNATURE.len())
@@ -98,7 +162,11 @@ pub fn check_directory(tail: &[u8], file_len: u64) -> Result<()> {
     {
         return Err(Error::NotAZip);
     }
-    Ok(())
+    Ok(DirectoryClaim {
+        offset: directory_offset,
+        size: directory_size,
+        entries,
+    })
 }
 
 #[cfg(test)]
@@ -145,6 +213,39 @@ mod tests {
         let tail = with_preceding_bytes(eocd(2, 100, 0, b""));
         assert!(check_directory(&tail, 1000).is_ok());
         assert!(check_directory(&eocd(0, 0, 0, b""), 22).is_ok());
+    }
+
+    #[test]
+    fn returns_where_the_directory_starts() {
+        let tail = with_preceding_bytes(eocd(2, 100, 500, b""));
+        assert_eq!(check_directory(&tail, 1000).unwrap(), 500);
+
+        let file_len = 10_000_000u64;
+        let record_offset = file_len - (56 + 20 + 22);
+        let tail = zip64_end(300_000, 22_000_000, 7_000_000, record_offset);
+        assert_eq!(check_directory(&tail, file_len).unwrap(), 7_000_000);
+    }
+
+    #[test]
+    fn the_claimed_directory_ends_where_its_records_can_reach() {
+        let tail = with_preceding_bytes(eocd(2, 100, 500, b""));
+        let claim = check_end_records(&tail, 1000).unwrap();
+        assert_eq!(
+            claim,
+            DirectoryClaim {
+                offset: 500,
+                size: 100,
+                entries: 2
+            }
+        );
+        assert_eq!(claim.end(), 600);
+
+        let tail = with_preceding_bytes(eocd(2, 8_000_000, 0, b""));
+        let claim = check_end_records(&tail, 9_000_000).unwrap();
+        assert_eq!(claim.end(), 2 * MAX_DIRECTORY_RECORD_LENGTH);
+
+        let empty = check_end_records(&eocd(0, 0, 0, b""), 22).unwrap();
+        assert_eq!(empty.end(), 0);
     }
 
     #[test]

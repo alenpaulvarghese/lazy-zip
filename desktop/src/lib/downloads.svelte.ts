@@ -1,5 +1,6 @@
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { cancelDownload, startDownload } from "./api";
+import type { Header } from "./headers";
 import type { ActiveFile, DownloadTarget, JobEvent } from "./types";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled";
@@ -29,6 +30,8 @@ export interface DownloadJob {
 export interface NewDownload {
   label: string;
   url: string;
+  /** Kept only in memory, like every request here. */
+  headers: Header[];
   target: DownloadTarget;
   /** Uncompressed size of each file, by its path in the archive. */
   sizes: Map<string, number>;
@@ -116,7 +119,7 @@ export class DownloadManager {
     };
 
     try {
-      job.jobId = await startDownload(download.url, target, download.workers, onEvent);
+      job.jobId = await startDownload(download.url, download.headers, target, download.workers, onEvent);
     } catch (err: unknown) {
       job.status = "failed";
       job.failures.push({ path: download.label, error: String(err) });

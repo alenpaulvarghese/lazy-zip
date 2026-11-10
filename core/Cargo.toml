@@ -3,10 +3,16 @@ name = "lazy-zip-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Browse remote ZIP archives over HTTP Range requests and download only the entries you pick"
+readme = "README.md"
+repository = "https://github.com/alenpaulvarghese/lazy-zip"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false }
 async_zip = { version = "0.0.18", features = ["tokio", "deflate", "deflate64", "bzip2", "zstd", "lzma", "xz"] }
+# The decoders async_zip uses, driven directly so each entry is read with only its own bytes.
+async-compression = { version = "0.4", features = ["tokio", "deflate", "deflate64", "bzip2", "zstd", "xz"] }
+crc32fast = "1"
 # Linked statically so the app doesn't depend on a liblzma installed on the build machine.
 liblzma = { version = "0.4", features = ["static"] }
 tokio-util = { version = "0.7", features = ["compat", "io", "rt"] }
@@ -15,12 +21,10 @@ tokio = { version = "1", features = ["io-util", "fs", "macros", "time"] }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 bytes = "1.0"
-async-stream = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 tempfile = "3"
-crc32fast = "1"
 flate2 = "1"
 
 [features]

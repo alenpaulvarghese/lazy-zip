@@ -13,7 +13,7 @@ Lazy ZIP reads an archive's table of contents using HTTP Range requests, so you 
 - **Pick what you want:** select individual files, ranges or whole folders, and see the total size before downloading.
 - **Download manager:** live progress in bytes, cancel, retry only what failed, and show the result in its folder.
 - **Keyboard shortcuts:** the bar along the bottom shows what works right now. Press `?` for the full list.
-- **Safe with untrusted archives:** unsafe file names are refused, every file's size and checksum are verified, and a failed download never damages an existing file.
+- **Safe with untrusted archives:** unsafe file names are refused, files whose headers disagree or overlap (a zip bomb trick) are refused, every file's size and checksum are verified, and a failed download never damages an existing file.
 
 ## Download
 
@@ -54,17 +54,17 @@ ZIP files keep their table of contents at the end. Lazy ZIP fetches the end of t
 
 Listing costs at least 66 KB, or the whole file if it's smaller, plus roughly 50–100 bytes per entry.
 
-Downloading costs more than the files themselves, because each file currently re-reads the table of contents and fetches at least 1 MiB. One 158 KB image from COCO val2017 used 1.4 MB. **Selecting many small files can use more data than downloading the whole archive.** The download manager shows the real figure for each job, and fixing this is the next major improvement.
+The table of contents is read once, and downloads reuse the one from the scan. After that, each file costs about its compressed size plus a header of about 30 bytes, so selecting many small files costs little more than the files themselves. The download manager shows the real figure for each job.
 
 ## Limitations
 
 - **The server must support Range requests.** Without them you get a clear error rather than a large download. GitHub's automatic source archives are an example.
 - **Compression:** Stored, Deflate, Deflate64, BZip2, Zstandard and XZ can be extracted. LZMA is listed but can't be extracted.
 - **One entry with any other method, such as PPMd or AES encryption, stops the whole archive from opening.**
-- **Encrypted files can't be extracted.** They fail their checksum instead of saving garbage.
+- **Encrypted files can't be extracted.** They're refused after reading only their header, instead of being downloaded.
 - **Refused names:** entries with `..`, absolute paths, backslashes, Windows reserved names, or characters like `?` and `:` are listed as unsafe and can't be downloaded, on every platform. Names that aren't valid UTF-8 are refused too.
 - **Size limits:** archives with more than 5 million entries, or a table of contents over 512 MB, are refused.
-- **No custom headers or logins yet,** so private files need a URL that works on its own, such as a presigned one.
+- **Logins work through custom headers,** such as `Authorization: Bearer ...` or `X-API-Key: ...`, added with **Headers** next to the URL. They're kept only until you quit the app, and aren't sent to another site if the server redirects there. Presigned URLs still work on their own, without any headers.
 - **No resuming after you quit the app.** Dropped connections are retried, but an interrupted file starts again.
 
 ## Troubleshooting
@@ -84,6 +84,7 @@ curl -sI -H 'Range: bytes=0-99' '<url>' | head -n 1
 | This file isn't a ZIP archive | The URL returned something else, often a web page. Use the direct link to the file. |
 | The archive changed on the server | The file was replaced after you scanned it. Scan it again. |
 | ... is corrupted | The data didn't match its checksum or size. Try again, and if it persists, the archive itself is damaged. |
+| ... looks malicious | The file's headers disagree or it overlaps another file, a trick used by zip bombs, so it isn't extracted. |
 | compression not supported | An entry uses a method listed under Limitations, so the archive can't be opened. |
 
 ## Build from source
@@ -101,9 +102,17 @@ npm run tauri build
 
 | Directory | Description |
 |-----------|-------------|
-| `core/` | `lazy-zip-core`: HTTP reader, ZIP handling and downloader |
+| `core/` | `lazy-zip-core`: the Rust library behind everything else. HTTP reader, ZIP handling and downloader. See [its README](core/README.md). |
 | `desktop/` | Tauri and SvelteKit desktop app |
-| `python/` | Experimental Python bindings, not yet on PyPI. See [its README](python/README.md). |
+| `python/` | Python bindings with a `zipfile`-like API (`lazy_zip.RemoteZip`), not yet on PyPI. See [its README](python/README.md). |
+| `docs/` | [How the library works](docs/architecture.md), for contributors |
+
+## Documentation
+
+- **Using the Rust crate:** [core/README.md](core/README.md) is the integration guide. For the API
+  reference, run `cargo doc -p lazy-zip-core --open`.
+- **Using the Python package:** [python/README.md](python/README.md).
+- **How it works inside:** [docs/architecture.md](docs/architecture.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to work on the project, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 

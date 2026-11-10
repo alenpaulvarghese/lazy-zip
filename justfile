@@ -1,5 +1,5 @@
 # Run everything CI runs for core and desktop.
-ci: fmt lint test frontend
+ci: fmt lint test docs frontend
 
 fmt:
     cargo fmt --all -- --check
@@ -9,6 +9,10 @@ lint:
 
 test:
     cargo test -p lazy-zip-core
+
+# Fails on broken links and missing docs in the API reference.
+docs:
+    RUSTDOCFLAGS="-D warnings" cargo doc -p lazy-zip-core --no-deps
 
 frontend:
     cd desktop && npm run check && npm test
