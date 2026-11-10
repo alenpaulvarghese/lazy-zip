@@ -1,63 +1,201 @@
+//! The crate's error type.
+//!
+//! [`Error`](enum@Error)'s messages are written for people and never include the archive's URL,
+//! which can contain a signed token. Match on [`Error::kind`] to react to a failure in code.
+
 use thiserror::Error;
 
+/// Everything that can go wrong. Each variant's message is shown by its `Display`.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// The request failed: it couldn't connect, timed out, or the connection broke. The URL is
+    /// removed from the inner error.
     #[error("Network error: {}", network_cause(.0))]
     Http(reqwest::Error),
 
+    /// The server answered with an error status, after any retries.
     #[error("The server returned HTTP {status}")]
-    HttpStatus { status: u16 },
+    HttpStatus {
+        /// The HTTP status code.
+        status: u16,
+    },
 
+    /// The server sent the whole file instead of the part asked for.
     #[error(
         "The server doesn't support partial downloads (HTTP Range requests), so this archive can't be browsed remotely"
     )]
     RangeNotSupported,
 
+    /// The file's `ETag`, `Last-Modified` or length changed since the archive was opened.
     #[error("The archive changed on the server. Scan it again")]
     RemoteChanged,
 
+    /// The server's response broke the HTTP rules for a partial download, such as the wrong
+    /// range, a compressed body or more data than was asked for.
     #[error("The server sent an invalid response: {0}")]
     InvalidResponse(&'static str),
 
+    /// The connection ended early, and retrying didn't get the rest.
     #[error("The connection ended before all the data arrived")]
     TruncatedResponse,
 
+    /// No usable end of central directory record was found.
     #[error("This file isn't a ZIP archive, or the end of it is damaged")]
     NotAZip,
 
+    /// The archive claims too many entries or too large a directory, or reading the directory
+    /// fetched too much.
     #[error("This archive is too large to open safely: {0}")]
     LimitExceeded(&'static str),
 
+    /// The archive couldn't be parsed.
     #[error("ZIP error: {0}")]
     Zip(String),
 
+    /// No entry has that name or index.
     #[error("File not found: {0}")]
     FileNotFound(String),
 
+    /// An entry's data doesn't match its CRC-32.
     #[error("{path} is corrupted: its checksum doesn't match")]
-    CrcMismatch { path: String },
+    CrcMismatch {
+        /// The entry's name.
+        path: String,
+    },
 
+    /// An entry's data isn't the size its directory record claims.
     #[error("{path} is corrupted: expected {expected} bytes but got {actual}")]
     SizeMismatch {
+        /// The entry's name.
         path: String,
+        /// The size the directory claims.
         expected: u64,
+        /// The bytes read before the mismatch was found. Reading stops one byte past `expected`.
         actual: u64,
     },
 
+    /// An entry looks crafted to cause harm, such as data overlapping another entry.
     #[error("{path} looks malicious: {reason}")]
-    SuspiciousEntry { path: String, reason: &'static str },
+    SuspiciousEntry {
+        /// The entry's name.
+        path: String,
+        /// Why it was refused.
+        reason: &'static str,
+    },
 
+    /// An entry uses a compression method that can't be extracted, such as LZMA.
     #[error("{path} can't be extracted: its compression method isn't supported ({method})")]
-    UnsupportedCompression { path: String, method: &'static str },
+    UnsupportedCompression {
+        /// The entry's name.
+        path: String,
+        /// The method's name.
+        method: &'static str,
+    },
 
+    /// An entry is encrypted. It was refused after reading only its local header.
+    #[error("{path} can't be extracted: it's encrypted")]
+    Encrypted {
+        /// The entry's name.
+        path: String,
+    },
+
+    /// Reading or writing a local file failed.
     #[error("IO error: {0}")]
     Io(std::io::Error),
 
-    #[error("Unsafe entry \"{entry}\": {reason}")]
-    UnsafeEntry { entry: String, reason: &'static str },
+    /// A custom header's name or value is invalid, or it's one the client sets itself. Holds the
+    /// header's name, never its value.
+    #[error("Invalid header: {0}")]
+    InvalidHeader(String),
 
+    /// An entry's name can't be written safely as a path.
+    #[error("Unsafe entry \"{entry}\": {reason}")]
+    UnsafeEntry {
+        /// The name, shortened for display.
+        entry: String,
+        /// Why it was refused.
+        reason: &'static str,
+    },
+
+    /// The operation was cancelled.
     #[error("Cancelled")]
     Cancelled,
+}
+
+/// What sort of failure an [`Error`](enum@Error) is, for callers that react differently to each.
+///
+/// It serializes in camelCase, such as `"rangeNotSupported"`.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorKind {
+    /// The connection failed, or the server sent something unusable.
+    Network,
+    /// The server answered with an error status.
+    HttpStatus,
+    /// The server doesn't support Range requests, so the archive can't be read remotely.
+    RangeNotSupported,
+    /// The file changed on the server since the archive was opened. Open it again.
+    RemoteChanged,
+    /// The file isn't a ZIP archive.
+    NotAZip,
+    /// The archive is too large to open safely.
+    LimitExceeded,
+    /// The data didn't match its size or checksum, or couldn't be parsed.
+    Corrupt,
+    /// The entry looks crafted to cause harm.
+    Suspicious,
+    /// The entry is encrypted, or its compression method isn't supported.
+    Unsupported,
+    /// No entry has that name.
+    NotFound,
+    /// The name can't be written safely.
+    Unsafe,
+    /// A custom header is invalid.
+    InvalidHeader,
+    /// Reading or writing a local file failed.
+    Io,
+    /// The operation was cancelled.
+    Cancelled,
+}
+
+impl Error {
+    /// The sort of failure this is.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lazy_zip_core::{Error, ErrorKind};
+    ///
+    /// let error = Error::CrcMismatch { path: "data/a.csv".to_string() };
+    /// assert_eq!(error.kind(), ErrorKind::Corrupt);
+    /// assert_eq!(error.to_string(), "data/a.csv is corrupted: its checksum doesn't match");
+    ///
+    /// assert_eq!(Error::RemoteChanged.kind(), ErrorKind::RemoteChanged);
+    /// ```
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Error::Http(_) | Error::InvalidResponse(_) | Error::TruncatedResponse => {
+                ErrorKind::Network
+            }
+            Error::HttpStatus { .. } => ErrorKind::HttpStatus,
+            Error::RangeNotSupported => ErrorKind::RangeNotSupported,
+            Error::RemoteChanged => ErrorKind::RemoteChanged,
+            Error::NotAZip => ErrorKind::NotAZip,
+            Error::LimitExceeded(_) => ErrorKind::LimitExceeded,
+            Error::Zip(_) | Error::CrcMismatch { .. } | Error::SizeMismatch { .. } => {
+                ErrorKind::Corrupt
+            }
+            Error::SuspiciousEntry { .. } => ErrorKind::Suspicious,
+            Error::UnsupportedCompression { .. } | Error::Encrypted { .. } => {
+                ErrorKind::Unsupported
+            }
+            Error::FileNotFound(_) => ErrorKind::NotFound,
+            Error::UnsafeEntry { .. } => ErrorKind::Unsafe,
+            Error::InvalidHeader(_) => ErrorKind::InvalidHeader,
+            Error::Io(_) => ErrorKind::Io,
+            Error::Cancelled => ErrorKind::Cancelled,
+        }
+    }
 }
 
 /// The most specific reason available, such as "Connection refused", since a request error's own
@@ -112,6 +250,7 @@ impl From<async_zip::error::ZipError> for Error {
     }
 }
 
+/// A [`std::result::Result`] with this crate's [`Error`](enum@Error).
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

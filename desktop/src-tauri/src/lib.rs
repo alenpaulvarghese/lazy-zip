@@ -1,9 +1,10 @@
+use lazy_zip_core::archive::RemoteArchive;
 use lazy_zip_core::downloader::{
-    download_batch, find_existing, plan_selection, BatchEvent, BatchFile, BatchOptions,
-    SelectionPlan,
+    download_batch, download_from, find_existing, plan_selection, BatchEvent, BatchFile,
+    BatchOptions, BatchReport, SelectionPlan,
 };
-use lazy_zip_core::http_reader::{ReaderConfig, RemoteHttpReader};
-use lazy_zip_core::zip_explorer::{ScanResult, ZipExplorer};
+use lazy_zip_core::http_reader::ReaderConfig;
+use lazy_zip_core::zip_explorer::{scan, ScanResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,6 +41,74 @@ impl DownloadJobs {
         while !self.running().is_empty() && started.elapsed() < timeout {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+/// An HTTP header the user added, such as `Authorization`. Deliberately not `Debug`, so the value
+/// can't end up in a log.
+#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct Header {
+    name: String,
+    value: String,
+}
+
+fn reader_config(headers: &[Header]) -> Result<ReaderConfig, String> {
+    ReaderConfig::with_headers(
+        headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str())),
+    )
+    .map_err(|error| match error {
+        // The core error names the header but never includes its value.
+        lazy_zip_core::Error::InvalidHeader(name) => format!(
+            "The header \"{}\" can't be used. Check that its name has no spaces or symbols like \
+             \":\", and its value has only plain text. Range and Accept-Encoding are set by Lazy \
+             ZIP and can't be added.",
+            name.trim()
+        ),
+        other => other.to_string(),
+    })
+}
+
+/// The most recently scanned archive, so downloads from it don't read its directory again. Only
+/// one is kept, and a new scan replaces it. It's keyed by the headers too, since they can change
+/// what the server returns.
+type ScannedArchive = LastScan<RemoteArchive>;
+
+struct LastScan<T>(Mutex<Option<Scanned<T>>>);
+
+struct Scanned<T> {
+    url: String,
+    headers: Vec<Header>,
+    archive: Arc<T>,
+}
+
+impl<T> Default for LastScan<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T> LastScan<T> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Scanned<T>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn replace(&self, url: String, headers: Vec<Header>, archive: T) {
+        *self.lock() = Some(Scanned {
+            url,
+            headers,
+            archive: Arc::new(archive),
+        });
+    }
+
+    /// The scanned archive, if it was scanned from `url` with exactly `headers`.
+    fn get(&self, url: &str, headers: &[Header]) -> Option<Arc<T>> {
+        self.lock()
+            .as_ref()
+            .filter(|scanned| scanned.url == url && scanned.headers == headers)
+            .map(|scanned| scanned.archive.clone())
     }
 }
 
@@ -135,7 +204,7 @@ impl ProgressTracker {
                 state.finished_bytes += done;
                 state.files_done += 1;
             }
-            BatchEvent::FileFailed { path, error } => {
+            BatchEvent::FileFailed { path, error, .. } => {
                 state.active.remove(path);
                 force_send = true;
                 let _ = self.channel.send(JobEvent::FileFailed {
@@ -177,12 +246,18 @@ fn snapshot(state: &ProgressState) -> JobEvent {
 }
 
 #[tauri::command]
-async fn scan_zip(url: String) -> Result<ScanResult, String> {
-    let reader = RemoteHttpReader::new(&url)
+async fn scan_zip(
+    scanned: State<'_, ScannedArchive>,
+    url: String,
+    headers: Vec<Header>,
+) -> Result<ScanResult, String> {
+    let config = reader_config(&headers)?;
+    let archive = RemoteArchive::open(&url, config)
         .await
         .map_err(|e| e.to_string())?;
-    let mut explorer = ZipExplorer::new(reader);
-    explorer.list_files().await.map_err(|e| e.to_string())
+    let result = scan(&archive);
+    scanned.replace(url, headers, archive);
+    Ok(result)
 }
 
 /// Returns the selected entries whose destination already exists.
@@ -191,20 +266,46 @@ async fn find_existing_files(dest_dir: PathBuf, base: String, files: Vec<String>
     find_existing(&plan_selection(&dest_dir, &base, files).files).await
 }
 
+/// Downloads from `archive` if it's already open, so its directory isn't read again, or from `url`.
+async fn download<F>(
+    archive: Option<Arc<RemoteArchive>>,
+    url: &str,
+    files: Vec<BatchFile>,
+    options: BatchOptions,
+    on_event: F,
+) -> BatchReport
+where
+    F: for<'a> Fn(BatchEvent<'a>) + Send + Sync,
+{
+    match archive {
+        Some(archive) => download_from(&archive, files, options, on_event).await,
+        None => download_batch(url, files, options, on_event).await,
+    }
+}
+
 /// Starts a download and returns its job ID. Progress arrives through `on_event`.
+///
+/// If `url` and `headers` match the last archive scanned, its directory is reused instead of read
+/// again.
 #[tauri::command]
 fn start_download(
     jobs: State<'_, DownloadJobs>,
+    scanned: State<'_, ScannedArchive>,
     url: String,
+    headers: Vec<Header>,
     target: DownloadTarget,
     workers: usize,
     on_event: Channel<JobEvent>,
 ) -> Result<u64, String> {
-    let reader = ReaderConfig::new().map_err(|e| e.to_string())?;
+    let reader = reader_config(&headers)?;
     let (plan, root) = match target {
         DownloadTarget::File { zip_path, dest } => (
             SelectionPlan {
-                files: vec![BatchFile { zip_path, dest }],
+                files: vec![BatchFile {
+                    zip_path,
+                    dest,
+                    index: None,
+                }],
                 rejected: Vec::new(),
             },
             None,
@@ -216,6 +317,7 @@ fn start_download(
         } => (plan_selection(&dest_dir, &base, files), Some(dest_dir)),
     };
 
+    let archive = scanned.get(&url, &headers);
     let cancel = CancellationToken::new();
     let job_id = jobs.next_id.fetch_add(1, Ordering::Relaxed);
     jobs.running().insert(job_id, cancel.clone());
@@ -237,7 +339,10 @@ fn start_download(
             root,
             reader,
         };
-        let report = download_batch(&url, plan.files, options, |event| tracker.handle(event)).await;
+        let report = download(archive, &url, plan.files, options, |event| {
+            tracker.handle(event)
+        })
+        .await;
 
         jobs.running().remove(&job_id);
         tracker.send_final_progress();
@@ -265,6 +370,7 @@ pub fn run() {
     let jobs = DownloadJobs::default();
     tauri::Builder::default()
         .manage(jobs.clone())
+        .manage(ScannedArchive::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -310,6 +416,72 @@ mod tests {
             DownloadTarget::File { zip_path, dest }
                 if zip_path == "a.txt" && dest == Path::new("/out/a.txt")
         ));
+    }
+
+    fn header(name: &str, value: &str) -> Header {
+        Header {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn headers_match_what_the_frontend_sends() {
+        let headers: Vec<Header> = serde_json::from_value(json!([
+            { "name": "Authorization", "value": "Bearer abc" },
+            { "name": "X-API-Key", "value": "123" },
+        ]))
+        .unwrap();
+        assert!(
+            headers
+                == [
+                    header("Authorization", "Bearer abc"),
+                    header("X-API-Key", "123")
+                ]
+        );
+        assert!(serde_json::from_value::<Vec<Header>>(json!([]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn invalid_headers_are_explained_without_their_values() {
+        assert!(reader_config(&[header("Authorization", "Bearer abc")]).is_ok());
+        assert!(reader_config(&[]).is_ok());
+
+        let error = reader_config(&[header("Range", "bytes=0-1")])
+            .err()
+            .unwrap();
+        assert!(error.contains("\"Range\""), "{error}");
+        assert!(!error.contains("bytes=0-1"), "{error}");
+
+        let error = reader_config(&[header("X-Token", "secret\nvalue")])
+            .err()
+            .unwrap();
+        assert!(error.contains("\"X-Token\""), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+
+        assert!(reader_config(&[header("Bad Name", "x")]).is_err());
+    }
+
+    #[test]
+    fn the_scanned_archive_is_reused_only_with_the_same_url_and_headers() {
+        let scanned = LastScan::<&str>::default();
+        let url = "https://example.com/a.zip";
+        let token = vec![header("Authorization", "Bearer one")];
+        assert!(scanned.get(url, &token).is_none());
+
+        scanned.replace(url.to_string(), token.clone(), "archive");
+        assert_eq!(scanned.get(url, &token).as_deref(), Some(&"archive"));
+        assert!(scanned.get(url, &[]).is_none());
+        assert!(scanned
+            .get(url, &[header("Authorization", "Bearer two")])
+            .is_none());
+        assert!(scanned.get("https://example.com/b.zip", &token).is_none());
+
+        scanned.replace(url.to_string(), Vec::new(), "without headers");
+        assert_eq!(scanned.get(url, &[]).as_deref(), Some(&"without headers"));
+        assert!(scanned.get(url, &token).is_none());
     }
 
     #[test]
@@ -373,6 +545,7 @@ mod tests {
         tracker.handle(BatchEvent::FileFailed {
             path: "b",
             error: "boom".to_string(),
+            kind: lazy_zip_core::ErrorKind::Network,
         });
         tracker.send_final_progress();
 

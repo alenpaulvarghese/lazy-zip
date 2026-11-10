@@ -21,6 +21,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+[project.scripts]
+lazy-zip = "lazy_zip.__main__:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.maturin]
+python-source = "python"
+module-name = "lazy_zip._lazy_zip"
 features = ["pyo3/extension-module"]
 strip = true
