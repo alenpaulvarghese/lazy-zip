@@ -23,13 +23,14 @@ The crate isn't on crates.io. Add it from Git, by its package name `lazy-zip-cor
 
 ```toml
 [dependencies]
-lazy-zip-core = { git = "https://github.com/alenpaulvarghese/lazy-zip", rev = "<commit>" }
+lazy-zip-core = { git = "https://github.com/alenpaulvarghese/lazy-zip", tag = "v0.3.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Cargo finds the package inside the repository's workspace. Pin a `rev`, since the API changes
-between commits (the `v0.2.0` tag predates the API described here). For a local checkout, use
-`{ path = "../lazy-zip/core" }` instead. Import it as `lazy_zip_core`.
+Cargo finds the package inside the repository's workspace. Pin a release `tag` (or a `rev`), since
+the API may change in any release before 1.0. Releases before `v0.3.0` predate the API described
+here. For a local checkout, use `{ path = "../lazy-zip/core" }` instead. Import it as
+`lazy_zip_core`.
 
 - **Rust:** edition 2021. No minimum version is declared; it's built and tested with current
   stable.
