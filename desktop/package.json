@@ -24,7 +24,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.1.1",
     "@tailwindcss/vite": "^4.3.5",
     "@tauri-apps/cli": "^2.12.4",
-    "autoprefixer": "^10.5.0",
+    "autoprefixer": "^10.6.2",
     "postcss": "^8.5.14",
     "svelte": "^5.57.3",
     "svelte-check": "^4.4.8",
